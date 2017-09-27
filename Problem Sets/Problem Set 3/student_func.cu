@@ -79,7 +79,97 @@
 
 */
 
+#include "stdio.h"
+#include "reference_calc.cpp"
 #include "utils.h"
+
+#define MAX(x, y) (((x) > (y)) ? (x) : (y))
+#define MIN(x, y) (((x) < (y)) ? (x) : (y))
+
+__global__ void shmem_min_kernel(const float* const d_logLuminance, float* d_min_logLum,
+                                          const size_t numRows, const size_t numCols)
+{
+   extern __shared__ float sdata[];
+   int x_index = blockDim.x * blockIdx.x + threadIdx.x;
+   int y_index = blockDim.y * blockIdx.y + threadIdx.y;
+   int offset = numCols * y_index + x_index;
+   int myId = blockDim.x * threadIdx.y + threadIdx.x;
+   
+   sdata[myId] = d_logLuminance[offset];
+   __syncthreads();
+       
+   for (unsigned int r = blockDim.y/2; r > 0; r >>= 1){
+       if(threadIdx.y < r)
+       {
+          sdata[myId] = MIN(sdata[myId], sdata[blockDim.x * (threadIdx.y + r) + threadIdx.x]);
+       }
+    }
+       
+   for (unsigned int c = blockDim.x/2; c > 0; c >>= 1){
+      if(threadIdx.x < c)
+      {
+         sdata[threadIdx.x] = MIN(sdata[threadIdx.x], sdata[threadIdx.x + c]);
+      }
+   }
+       
+   if(threadIdx.x == 0 && threadIdx.y ==0)
+   {
+      *d_min_logLum  = MIN(*d_min_logLum,sdata[0]);
+   }
+}
+
+__global__ void shmem_max_kernel(const float* const d_logLuminance, float *d_max_logLum,
+                                          const size_t numRows, const size_t numCols)
+{
+   extern __shared__ float sdata[];
+   int x_index = blockDim.x * blockIdx.x + threadIdx.x;
+   int y_index = blockDim.y * blockIdx.y + threadIdx.y;
+   int offset = numCols * y_index + x_index;
+   int myId = blockDim.x * threadIdx.y + threadIdx.x;
+   
+   sdata[myId] = d_logLuminance[offset];
+   __syncthreads();
+       
+   for (unsigned int r = blockDim.y/2; r > 0; r >>= 1){
+       if(threadIdx.y < r)
+       {
+          sdata[myId] = MAX(sdata[myId], sdata[blockDim.x * (threadIdx.y + r) + threadIdx.x]);
+       }
+    }
+       
+   for (unsigned int c = blockDim.x/2; c > 0; c >>= 1){
+      if(threadIdx.x < c)
+      {
+         sdata[threadIdx.x] = MAX(sdata[threadIdx.x], sdata[threadIdx.x + c]);
+      }
+   }
+       
+   if(threadIdx.x == 0 && threadIdx.y ==0)
+   {
+      *d_max_logLum  = MAX(*d_max_logLum,sdata[0]);
+   }
+}
+
+__global__ void histogram(const float* const d_logLuminance, float *d_min_logLum, float *d_max_logLum, int *d_bins,
+                          float *d_lumRange, const size_t numRows, const size_t numCols, const size_t numBins)
+{
+   int x_index = blockDim.x * blockIdx.x + threadIdx.x;
+   int y_index = blockDim.y * blockIdx.y + threadIdx.y;
+   int offset = numCols * y_index + x_index;
+   int bin = int((d_logLuminance[offset] - *d_min_logLum) / *d_lumRange * (numBins-1));
+   atomicAdd(&(d_bins[bin]),1);
+}
+
+__global__ void exclusiveScan(unsigned int* const d_cdf, int *d_bins, const size_t numBins)
+{
+   int acc = 0;
+   //int index = blockIdx.x* blockDim.x + threadIdx.x;
+   for (int i = 0; i < numBins; i++)
+   {
+      d_cdf[i] = acc;
+      acc = acc + d_bins[i];
+   }
+}
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
@@ -99,6 +189,56 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
     4) Perform an exclusive scan (prefix sum) on the histogram to get
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
+    
+    int blockLength = 10;
+    const dim3 blockSize(blockLength, blockLength, 1);
+    const dim3 gridSize(ceil(numCols/blockLength), ceil(numRows/blockLength), 1);
+    
+    float * d_min_logLum;
+    float * d_max_logLum;
+    
+    checkCudaErrors(cudaMalloc((void **) &d_min_logLum, sizeof(float)));
+    checkCudaErrors(cudaMemcpy(d_min_logLum, &min_logLum, sizeof(float), cudaMemcpyHostToDevice));
+    
+    checkCudaErrors(cudaMalloc((void **) &d_max_logLum, sizeof(float)));
+    checkCudaErrors(cudaMemcpy(d_max_logLum, &max_logLum, sizeof(float), cudaMemcpyHostToDevice));
+    
+    shmem_min_kernel<<<gridSize, blockSize, blockLength * blockLength * sizeof(int)>>>(d_logLuminance, d_min_logLum, numRows, numCols);
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+    
+    shmem_max_kernel<<<gridSize, blockSize, blockLength * blockLength * sizeof(int)>>>(d_logLuminance, d_max_logLum, numRows, numCols);
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 
+    checkCudaErrors(cudaMemcpy(&min_logLum, d_min_logLum, sizeof(float), cudaMemcpyDeviceToHost));
+    checkCudaErrors(cudaMemcpy(&max_logLum, d_max_logLum, sizeof(float), cudaMemcpyDeviceToHost));
 
+    float lumRange = max_logLum - min_logLum;
+    
+    float * d_lumRange;
+    checkCudaErrors(cudaMalloc((void **) &d_lumRange, sizeof(float)));
+    checkCudaErrors(cudaMemcpy(d_lumRange, &lumRange, sizeof(float), cudaMemcpyHostToDevice));
+    
+    int h_bins[numBins];
+    for (int i = 0; i < numBins; i++){
+       h_bins[i] = 0;
+    }
+    
+    int * d_bins;
+    
+    checkCudaErrors(cudaMalloc((void **) &d_bins, numBins * sizeof(int)));
+    checkCudaErrors(cudaMemcpy(d_bins, h_bins, numBins * sizeof(int), cudaMemcpyHostToDevice));
+    
+    histogram<<<gridSize, blockSize>>>(d_logLuminance, d_min_logLum, d_max_logLum, d_bins, d_lumRange, numRows, numCols, numBins);
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+    
+    checkCudaErrors(cudaMemcpy(h_bins, d_bins, numBins * sizeof(int), cudaMemcpyDeviceToHost));
+    
+    exclusiveScan<<<1, 1>>>(d_cdf, d_bins, numBins);
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+    
+    cudaFree(d_bins);
+    cudaFree(d_min_logLum);
+    cudaFree(d_max_logLum);
+    cudaFree(d_lumRange);
+    
 }
